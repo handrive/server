@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+[profile.release]
+lto = true           # Link-time optimization - inlines across crates, harder to reverse
+codegen-units = 1    # Single codegen unit for better optimization
+strip = "symbols"    # Remove debug symbols from binary
+panic = "abort"      # No unwinding info, smaller binary

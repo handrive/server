@@ -1,0 +1,131 @@
+# =============================================================================
+# Dev Docker Compose — runs alongside docker-compose.prod.yml
+# =============================================================================
+#
+# Architecture:
+#   Internet → Caddy (from prod) → server-dev:3001 (dev.handrive.ai)
+#   Internet → NATS dev (:4223 TLS)
+#   Server   → NATS dev (internal, via domain alias)
+#
+# Shares Caddy from prod via the caddy_net network.
+# Uses separate database, NATS instance, and TLS certificates.
+#
+# Prerequisites:
+#   - docker-compose.prod.yml must be running (provides Caddy + cert-exporter)
+#   - DOMAIN_DEV must be set in prod's .env so Caddy routes the dev domain
+#   - DNS A record for dev.handrive.ai → same Droplet IP
+#   - Separate 'handrive_dev' database created in managed PostgreSQL
+#
+# Required Environment Variables (in .env.dev):
+#   - DOMAIN_DEV: Dev domain (e.g., dev.handrive.ai)
+#   - DATABASE_URL_DEV: PostgreSQL connection string for dev database
+#   - JWT_SECRET_DEV: Separate JWT secret for dev
+#   - NATS_ACCOUNT_SIGNING_KEY_DEV, NATS_ACCOUNT_PUBLIC_KEY_DEV
+#   - IDENTITY_SIGNING_KEY_DEV
+#   - RESEND_API_KEY: Can reuse prod key
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # NATS Dev - Message broker (TLS on port 4223)
+  # ---------------------------------------------------------------------------
+  nats-dev:
+    image: nats:2.10-alpine
+    command:
+      - "-c"
+      - "/etc/nats/nats.conf"
+    volumes:
+      - ./nats-dev.conf:/etc/nats/nats.conf:ro
+      - certs_dev:/certs:ro
+    ports:
+      - "4223:4222"              # TLS client connections (external 4223 → internal 4222)
+      - "127.0.0.1:8223:8222"    # HTTP monitoring (localhost only)
+    networks:
+      default:
+        aliases:
+          - ${DOMAIN_DEV}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /certs/server.crt"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Server Dev - Rust/Axum API backend
+  # ---------------------------------------------------------------------------
+  server-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Database (separate dev database)
+      DATABASE_URL: ${DATABASE_URL_DEV}
+      DB_POOL_SIZE: ${DB_POOL_SIZE_DEV:-10}
+      # JWT (separate dev secret)
+      JWT_SECRET: ${JWT_SECRET_DEV}
+      JWT_ACCESS_TTL_SECS: ${JWT_ACCESS_TTL_SECS_DEV:-900}
+      JWT_REFRESH_TTL_SECS: ${JWT_REFRESH_TTL_SECS_DEV:-604800}
+      # Server
+      HOST: "0.0.0.0"
+      PORT: "3001"
+      LOG_LEVEL: ${LOG_LEVEL_DEV:-debug}
+      LOG_DIR: /var/log/handrive
+      CORS_ORIGINS: ${CORS_ORIGINS_DEV:-https://${DOMAIN_DEV}}
+      # NATS (TLS via domain alias — cert matches dev domain)
+      NATS_URL: tls://${DOMAIN_DEV}:4222
+      NATS_ACCOUNT_SIGNING_KEY: ${NATS_ACCOUNT_SIGNING_KEY_DEV}
+      NATS_ACCOUNT_PUBLIC_KEY: ${NATS_ACCOUNT_PUBLIC_KEY_DEV}
+      IDENTITY_SIGNING_KEY: ${IDENTITY_SIGNING_KEY_DEV:-}
+      # Google OAuth (optional — can reuse prod or use separate)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID_DEV:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET_DEV:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI_DEV:-https://${DOMAIN_DEV}/api/auth/google/callback}
+      # Apple Sign In (optional)
+      APPLE_CLIENT_ID: ${APPLE_CLIENT_ID_DEV:-}
+      APPLE_TEAM_ID: ${APPLE_TEAM_ID_DEV:-}
+      APPLE_KEY_ID: ${APPLE_KEY_ID_DEV:-}
+      APPLE_PRIVATE_KEY_FILE: ${APPLE_PRIVATE_KEY_FILE_DEV:-}
+      APPLE_REDIRECT_URI: ${APPLE_REDIRECT_URI_DEV:-https://${DOMAIN_DEV}/auth/apple/callback}
+      # Resend (email API — can share with prod)
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      RESEND_FROM: ${RESEND_FROM_DEV:-Handrive Dev <noreply@handrive.ai>}
+      # Test mode (optional — enables test helpers)
+      TEST_MODE: ${TEST_MODE_DEV:-false}
+      # Demo account
+      DEMO_EMAIL: ${DEMO_EMAIL_DEV:-}
+      DEMO_OTP: ${DEMO_OTP_DEV:-}
+    networks:
+      - default
+      - caddy_net
+    depends_on:
+      nats-dev:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  certs_dev:
+    external: true
+    name: handriveapp-server_certs_dev
+
+networks:
+  caddy_net:
+    external: true

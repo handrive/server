@@ -1,0 +1,216 @@
+# =============================================================================
+# GitHub Actions: Deploy Dev Environment
+# =============================================================================
+#
+# Deploys the dev environment alongside production on the same droplet.
+# Shares Caddy (reverse proxy + TLS) from the prod stack.
+#
+# Triggers on push to the 'dev' branch or manual dispatch.
+#
+# Required GitHub Secrets (in addition to prod secrets):
+#   - JWT_SECRET_DEV: Separate JWT secret for dev
+#   - NATS_ACCOUNT_SIGNING_KEY_DEV, NATS_ACCOUNT_PUBLIC_KEY_DEV
+#   - IDENTITY_SIGNING_KEY_DEV
+#
+# Reuses from prod: DIGITALOCEAN_ACCESS_TOKEN, DROPLET_SSH_KEY, GH_PAT,
+#   RESEND_API_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+#
+# =============================================================================
+
+name: Deploy Dev
+
+on:
+  workflow_dispatch:
+
+env:
+  DROPLET_NAME: handriveapp-server
+  DOMAIN_DEV: dev.handrive.ai
+  DOMAIN_PROD: api.handrive.ai
+  DB_NAME: handrive-db
+
+jobs:
+  deploy-dev:
+    name: Deploy Dev
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      # ========== SSH Key Setup ==========
+      - name: Setup SSH key
+        id: ssh
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      # ========== Get Droplet IP ==========
+      - name: Get Droplet IP
+        id: droplet
+        run: |
+          DROPLET_IP=$(doctl compute droplet list --format Name,PublicIPv4 --no-header | grep "^${{ env.DROPLET_NAME }}" | awk '{print $2}')
+          if [ -z "$DROPLET_IP" ]; then
+            echo "Droplet not found. Deploy prod first."
+            exit 1
+          fi
+          echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+
+      # ========== Get Database URL ==========
+      - name: Get Database URL
+        id: db
+        run: |
+          DB_ID=$(doctl databases list --format ID,Name --no-header | grep "${{ env.DB_NAME }}" | awk '{print $1}')
+          if [ -z "$DB_ID" ]; then
+            echo "Database not found. Deploy prod first."
+            exit 1
+          fi
+
+          # Create 'handrive_dev' database if it doesn't exist
+          if ! doctl databases db list $DB_ID --format Name --no-header | grep -q "^handrive_dev$"; then
+            echo "Creating 'handrive_dev' database..."
+            doctl databases db create $DB_ID handrive_dev
+          fi
+
+          DB_URL=$(doctl databases connection $DB_ID --format URI --no-header)
+          DB_URL=$(echo $DB_URL | sed 's|/defaultdb?|/handrive_dev?|')
+          echo "db_url=$DB_URL" >> $GITHUB_OUTPUT
+
+      # ========== Wait for SSH ==========
+      - name: Wait for SSH
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ steps.droplet.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          for i in {1..10}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+               -i ~/.ssh/deploy_key root@${{ steps.droplet.outputs.ip }} "echo 'SSH OK'" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "SSH connection failed"
+          exit 1
+
+      # ========== Deploy Dev ==========
+      - name: Deploy Dev Environment
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL_DEV: ${{ steps.db.outputs.db_url }}
+          JWT_SECRET_DEV: ${{ secrets.JWT_SECRET_DEV }}
+          NATS_ACCOUNT_SIGNING_KEY_DEV: ${{ secrets.NATS_ACCOUNT_SIGNING_KEY_DEV }}
+          NATS_ACCOUNT_PUBLIC_KEY_DEV: ${{ secrets.NATS_ACCOUNT_PUBLIC_KEY_DEV }}
+          IDENTITY_SIGNING_KEY_DEV: ${{ secrets.IDENTITY_SIGNING_KEY_DEV }}
+          GOOGLE_CLIENT_ID_DEV: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET_DEV: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          DEPLOY_DOMAIN_DEV: ${{ env.DOMAIN_DEV }}
+          DEPLOY_DOMAIN_PROD: ${{ env.DOMAIN_PROD }}
+        with:
+          host: ${{ steps.droplet.outputs.ip }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          envs: DATABASE_URL_DEV,JWT_SECRET_DEV,NATS_ACCOUNT_SIGNING_KEY_DEV,NATS_ACCOUNT_PUBLIC_KEY_DEV,IDENTITY_SIGNING_KEY_DEV,GOOGLE_CLIENT_ID_DEV,GOOGLE_CLIENT_SECRET_DEV,RESEND_API_KEY,GH_PAT,GH_REPO,DEPLOY_DOMAIN_DEV,DEPLOY_DOMAIN_PROD
+          command_timeout: 30m
+          script: |
+            set -e
+
+            cd /root/handrive.server
+
+            # Configure git and pull dev branch
+            git remote set-url origin https://${GH_PAT}@github.com/${GH_REPO}.git
+            git fetch origin dev
+            git checkout dev
+            git pull origin dev
+
+            # Ensure prod Caddy knows about dev domain
+            # Update DOMAIN_DEV in the prod .env so Caddy routes it
+            if ! grep -q "DOMAIN_DEV=" .env; then
+              echo "DOMAIN_DEV=${DEPLOY_DOMAIN_DEV}" >> .env
+            else
+              sed -i "s|^DOMAIN_DEV=.*|DOMAIN_DEV=${DEPLOY_DOMAIN_DEV}|" .env
+            fi
+
+            # Restart Caddy to pick up the dev domain
+            docker compose -f docker-compose.prod.yml up -d caddy
+
+            # Wait for dev TLS certificate
+            echo "Waiting for dev TLS certificate..."
+            for i in {1..60}; do
+              if docker compose -f docker-compose.prod.yml exec -T caddy test -f /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DEPLOY_DOMAIN_DEV}/${DEPLOY_DOMAIN_DEV}.crt 2>/dev/null; then
+                echo "Dev TLS certificate ready!"
+                break
+              fi
+              echo "  $i/60: Waiting for dev TLS certificate..."
+              sleep 5
+            done
+
+            # Re-export certs (picks up dev cert)
+            docker compose -f docker-compose.prod.yml restart cert-exporter
+
+            # Wait for cert-exporter to be healthy again
+            echo "Waiting for cert-exporter..."
+            for i in {1..30}; do
+              if docker compose -f docker-compose.prod.yml ps cert-exporter | grep -q "(healthy)"; then
+                break
+              fi
+              sleep 2
+            done
+
+            # Create .env.dev
+            cat > .env.dev << EOF
+            DOMAIN_DEV=${DEPLOY_DOMAIN_DEV}
+            DATABASE_URL_DEV=${DATABASE_URL_DEV}
+            DB_POOL_SIZE_DEV=10
+            JWT_SECRET_DEV=${JWT_SECRET_DEV}
+            JWT_ACCESS_TTL_SECS_DEV=86400
+            JWT_REFRESH_TTL_SECS_DEV=604800
+            LOG_LEVEL_DEV=debug
+            CORS_ORIGINS_DEV=https://${DEPLOY_DOMAIN_DEV}
+            NATS_ACCOUNT_SIGNING_KEY_DEV=${NATS_ACCOUNT_SIGNING_KEY_DEV}
+            NATS_ACCOUNT_PUBLIC_KEY_DEV=${NATS_ACCOUNT_PUBLIC_KEY_DEV}
+            IDENTITY_SIGNING_KEY_DEV=${IDENTITY_SIGNING_KEY_DEV}
+            GOOGLE_CLIENT_ID_DEV=${GOOGLE_CLIENT_ID_DEV}
+            GOOGLE_CLIENT_SECRET_DEV=${GOOGLE_CLIENT_SECRET_DEV}
+            GOOGLE_REDIRECT_URI_DEV=https://${DEPLOY_DOMAIN_DEV}/auth/callback
+            RESEND_API_KEY=${RESEND_API_KEY}
+            RESEND_FROM_DEV=Handrive Dev <noreply@handrive.ai>
+            EOF
+
+            # Build and deploy dev services
+            echo "Building dev server..."
+            docker compose -f docker-compose.dev.yml --env-file .env.dev build server-dev
+
+            echo "Starting dev services..."
+            docker compose -f docker-compose.dev.yml --env-file .env.dev up -d
+
+            # Wait for health
+            echo "Waiting for dev services to be healthy..."
+            for i in {1..24}; do
+              HEALTHY=$(docker compose -f docker-compose.dev.yml --env-file .env.dev ps | grep -c "(healthy)" || echo "0")
+              echo "  $i/24: $HEALTHY healthy..."
+              if [ "$HEALTHY" -ge 2 ]; then
+                echo "Dev services healthy!"
+                break
+              fi
+              sleep 5
+            done
+
+            docker compose -f docker-compose.dev.yml --env-file .env.dev ps
+
+            # Health check
+            if curl -sf https://${DEPLOY_DOMAIN_DEV}/api/health > /dev/null; then
+              echo "Dev deployment successful!"
+              echo "Dev API: https://${DEPLOY_DOMAIN_DEV}"
+              echo "Dev NATS: tls://${DEPLOY_DOMAIN_DEV}:4223"
+            else
+              echo "Dev health check failed"
+              docker compose -f docker-compose.dev.yml --env-file .env.dev logs --tail=50
+              exit 1
+            fi

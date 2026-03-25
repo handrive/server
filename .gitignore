@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker volumes (local dev)
+postgres_data/
+nats_data/
+nats_config/
+desktop/gen/schemas/windows-schema.json

@@ -1,0 +1,27 @@
+# Caddyfile for Handrive API
+# Automatic HTTPS with Let's Encrypt
+# Supports multiple environments (prod + dev) on the same droplet.
+
+{
+	# Global options
+	admin localhost:2019
+	email admin@handrive.ai
+}
+
+# Production API
+{$DOMAIN} {
+	reverse_proxy server:3001
+
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

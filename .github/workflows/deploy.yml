@@ -1,0 +1,564 @@
+# =============================================================================
+# GitHub Actions: Full Deployment to DigitalOcean
+# =============================================================================
+#
+# Fully automated deployment:
+#   - Creates Droplet if it doesn't exist
+#   - Creates managed PostgreSQL if it doesn't exist
+#   - Configures everything automatically
+#   - Deploys on every push to main
+#
+# Required GitHub Secrets:
+#   - DIGITALOCEAN_ACCESS_TOKEN: DO API token (read/write)
+#   - JWT_SECRET: JWT signing secret, min 32 chars (generate: openssl rand -base64 48)
+#   - DROPLET_SSH_KEY: SSH private key for droplet access
+#     Generate with: ssh-keygen -t ed25519 -f handrive_deploy -N "" -C "github-actions"
+#     Add public key to DigitalOcean: Settings → Security → SSH Keys
+#     Add private key content to this secret
+#   - NATS_ACCOUNT_SIGNING_KEY: NATS account seed (starts with SA)
+#   - NATS_ACCOUNT_PUBLIC_KEY: NATS account public key (starts with A)
+#     Generate both with: nk -gen account (install: go install github.com/nats-io/nkeys/nk@latest)
+#   - IDENTITY_SIGNING_KEY: Ed25519 key for NATS message signing (openssl rand -base64 32)
+#   - GH_PAT: GitHub Personal Access Token for cloning private repos
+#
+# Optional Secrets (for auth methods):
+#   - GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET: For Google OAuth
+#   - APPLE_CLIENT_ID, APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_PRIVATE_KEY: For Apple Sign In
+#   - RESEND_API_KEY: For email OTP (get from resend.com)
+#   - DEMO_EMAIL, DEMO_OTP: For App Store review (static demo account credentials)
+#
+# =============================================================================
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+env:
+  DROPLET_NAME: handriveapp-server
+  DROPLET_REGION: nyc1
+  DROPLET_SIZE: s-1vcpu-2gb
+  DROPLET_IMAGE: ubuntu-24-04-x64
+  DB_NAME: handrive-db
+  DB_SIZE: db-s-1vcpu-1gb
+  DOMAIN: api.handrive.ai
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      # ========== SSH Key Setup ==========
+      - name: Setup SSH key
+        id: ssh
+        run: |
+          mkdir -p ~/.ssh
+
+          # Use SSH key from secret (required)
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # Derive public key from private key
+          ssh-keygen -y -f ~/.ssh/deploy_key > ~/.ssh/deploy_key.pub
+
+          # Verify key
+          echo "SSH key fingerprint:"
+          ssh-keygen -lf ~/.ssh/deploy_key
+
+          # Check if SSH key exists in DigitalOcean
+          KEY_ID=$(doctl compute ssh-key list --format ID,Name --no-header | grep "github-actions" | awk '{print $1}' || true)
+
+          if [ -z "$KEY_ID" ]; then
+            echo "Adding SSH key to DigitalOcean..."
+            KEY_ID=$(doctl compute ssh-key create github-actions --public-key "$(cat ~/.ssh/deploy_key.pub)" --format ID --no-header)
+            echo "Created SSH key in DO: $KEY_ID"
+          else
+            echo "SSH key already exists in DO: $KEY_ID"
+          fi
+
+          # Save outputs
+          echo "::add-mask::$(cat ~/.ssh/deploy_key)"
+          {
+            echo 'private_key<<EOF'
+            cat ~/.ssh/deploy_key
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+          echo "key_id=$KEY_ID" >> $GITHUB_OUTPUT
+
+      # ========== Database Setup ==========
+      - name: Check/Create PostgreSQL database
+        id: db
+        run: |
+          # Check if database exists
+          DB_ID=$(doctl databases list --format ID,Name --no-header | grep "${{ env.DB_NAME }}" | awk '{print $1}' || true)
+
+          if [ -z "$DB_ID" ]; then
+            echo "Creating PostgreSQL database..."
+            doctl databases create ${{ env.DB_NAME }} \
+              --engine pg \
+              --version 16 \
+              --size ${{ env.DB_SIZE }} \
+              --region ${{ env.DROPLET_REGION }} \
+              --num-nodes 1 \
+              --wait
+            # Get the ID after creation
+            DB_ID=$(doctl databases list --format ID,Name --no-header | grep "${{ env.DB_NAME }}" | awk '{print $1}')
+            echo "Created database: $DB_ID"
+          else
+            echo "Database already exists: $DB_ID"
+          fi
+
+          # Create 'handrive' database if it doesn't exist
+          if ! doctl databases db list $DB_ID --format Name --no-header | grep -q "^handrive$"; then
+            echo "Creating 'handrive' database..."
+            doctl databases db create $DB_ID handrive
+          else
+            echo "Database 'handrive' already exists"
+          fi
+
+          # Get private connection string (VPC network, not public internet)
+          DB_URL=$(doctl databases connection $DB_ID --format URI --no-header --private)
+          # Replace default db name with 'handrive'
+          DB_URL=$(echo $DB_URL | sed 's|/defaultdb?|/handrive?|')
+
+          echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
+          echo "db_url=$DB_URL" >> $GITHUB_OUTPUT
+
+      # ========== Droplet Setup ==========
+      - name: Check/Create Droplet
+        id: droplet
+        run: |
+          # Check if droplet exists
+          DROPLET_IP=$(doctl compute droplet list --format Name,PublicIPv4 --no-header | grep "^${{ env.DROPLET_NAME }}" | awk '{print $2}' || true)
+
+          if [ -z "$DROPLET_IP" ]; then
+            echo "Creating Droplet..."
+
+            # Create cloud-init script
+            cat > /tmp/cloud-init.yml << 'CLOUDINIT'
+          #cloud-config
+          package_update: true
+          packages:
+            - curl
+            - git
+            - ufw
+          runcmd:
+            - curl -fsSL https://get.docker.com | sh
+            - systemctl enable docker
+            - systemctl start docker
+            - ufw allow 22/tcp
+            - ufw allow 80/tcp
+            - ufw allow 443/tcp
+            - ufw allow 4222/tcp
+            - ufw allow 4223/tcp
+            - ufw --force enable
+            - touch /root/.cloud-init-complete
+          CLOUDINIT
+
+            # Create droplet
+            doctl compute droplet create ${{ env.DROPLET_NAME }} \
+              --image ${{ env.DROPLET_IMAGE }} \
+              --size ${{ env.DROPLET_SIZE }} \
+              --region ${{ env.DROPLET_REGION }} \
+              --ssh-keys ${{ steps.ssh.outputs.key_id }} \
+              --user-data-file /tmp/cloud-init.yml \
+              --wait
+
+            # Get IP
+            DROPLET_IP=$(doctl compute droplet list --format Name,PublicIPv4 --no-header | grep "^${{ env.DROPLET_NAME }}" | awk '{print $2}')
+            echo "Created Droplet: $DROPLET_IP"
+
+            # Wait for cloud-init (Docker install, UFW setup)
+            echo "Waiting for cloud-init to complete..."
+            sleep 120
+
+            echo "is_new=true" >> $GITHUB_OUTPUT
+          else
+            echo "Droplet already exists: $DROPLET_IP"
+            echo "is_new=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Get private IP for VPC database access
+          DROPLET_PRIVATE_IP=$(doctl compute droplet list --format Name,PrivateIPv4 --no-header | grep "^${{ env.DROPLET_NAME }}" | awk '{print $2}')
+          echo "Droplet private IP: $DROPLET_PRIVATE_IP"
+
+          echo "ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+          echo "private_ip=$DROPLET_PRIVATE_IP" >> $GITHUB_OUTPUT
+
+      # ========== Verify SSH Connectivity ==========
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for SSH to become available on ${{ steps.droplet.outputs.ip }}..."
+
+          # Add host key to known_hosts to avoid prompt
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ steps.droplet.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # Retry SSH connection up to 30 times (5 minutes)
+          for i in {1..30}; do
+            echo "SSH attempt $i/30..."
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+               -i ~/.ssh/deploy_key root@${{ steps.droplet.outputs.ip }} "echo 'SSH OK'" 2>/dev/null; then
+              echo "✓ SSH connection successful!"
+              exit 0
+            fi
+            echo "  Waiting 10 seconds..."
+            sleep 10
+          done
+
+          echo "✗ SSH connection failed after 30 attempts"
+          exit 1
+
+      # ========== Database Firewall (VPC Only) ==========
+      - name: Configure database trusted sources
+        run: |
+          echo "Configuring database to only accept connections from droplet private IP..."
+
+          # Replace all firewall rules with just the droplet's private IP
+          doctl databases firewalls replace ${{ steps.db.outputs.db_id }} \
+            --rule ip_addr:${{ steps.droplet.outputs.private_ip }}
+
+          echo "✓ Database firewall configured - only ${{ steps.droplet.outputs.private_ip }} can connect"
+
+      # ========== Configure & Deploy ==========
+      - name: Configure and Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL: ${{ steps.db.outputs.db_url }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          NATS_ACCOUNT_SIGNING_KEY: ${{ secrets.NATS_ACCOUNT_SIGNING_KEY }}
+          NATS_ACCOUNT_PUBLIC_KEY: ${{ secrets.NATS_ACCOUNT_PUBLIC_KEY }}
+          IDENTITY_SIGNING_KEY: ${{ secrets.IDENTITY_SIGNING_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          APPLE_CLIENT_ID: ${{ secrets.APPLE_CLIENT_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+          APPLE_PRIVATE_KEY: ${{ secrets.APPLE_PRIVATE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          DEMO_EMAIL: ${{ secrets.DEMO_EMAIL }}
+          DEMO_OTP: ${{ secrets.DEMO_OTP }}
+          IS_NEW: ${{ steps.droplet.outputs.is_new }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          DEPLOY_DOMAIN: ${{ env.DOMAIN }}
+        with:
+          host: ${{ steps.droplet.outputs.ip }}
+          username: root
+          key: ${{ steps.ssh.outputs.private_key }}
+          envs: DATABASE_URL,JWT_SECRET,NATS_ACCOUNT_SIGNING_KEY,NATS_ACCOUNT_PUBLIC_KEY,IDENTITY_SIGNING_KEY,GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,APPLE_CLIENT_ID,APPLE_TEAM_ID,APPLE_KEY_ID,APPLE_PRIVATE_KEY,RESEND_API_KEY,DEMO_EMAIL,DEMO_OTP,IS_NEW,GH_PAT,GH_REPO,DEPLOY_DOMAIN
+          command_timeout: 30m
+          script: |
+            set -e
+
+            # Clone repository if not exists (using GitHub token for private repos)
+            if [ ! -d /root/handrive.server ]; then
+              echo "Cloning repository..."
+              git clone https://${GH_PAT}@github.com/${GH_REPO}.git /root/handrive.server
+            fi
+
+            cd /root/handrive.server
+
+            # Configure git to use token for pulls
+            git remote set-url origin https://${GH_PAT}@github.com/${GH_REPO}.git
+
+            # Pull latest changes
+            if [ "$IS_NEW" = "false" ]; then
+              echo "Pulling latest changes..."
+              git pull origin main
+            else
+              # For new deployments, ensure we have latest
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            # Write Apple private key to file (contains special characters that break .env)
+            # Always create the file (docker volume mount requires it to exist)
+            if [ -n "${APPLE_PRIVATE_KEY}" ]; then
+              echo "${APPLE_PRIVATE_KEY}" > /root/handrive.server/apple_private_key.pem
+            else
+              touch /root/handrive.server/apple_private_key.pem
+            fi
+            # Set ownership to container user (handrive UID 1000) and secure permissions
+            chown 1000:1000 /root/handrive.server/apple_private_key.pem
+            chmod 600 /root/handrive.server/apple_private_key.pem
+
+            # Create/update .env with correct variable names
+            cat > .env << EOF
+            DOMAIN=${DEPLOY_DOMAIN}
+            DATABASE_URL=${DATABASE_URL}
+            DB_POOL_SIZE=20
+            JWT_SECRET=${JWT_SECRET}
+            JWT_ACCESS_TTL_SECS=86400
+            JWT_REFRESH_TTL_SECS=604800
+            LOG_LEVEL=info
+            CORS_ORIGINS=https://${DEPLOY_DOMAIN}
+            NATS_ACCOUNT_SIGNING_KEY=${NATS_ACCOUNT_SIGNING_KEY}
+            NATS_ACCOUNT_PUBLIC_KEY=${NATS_ACCOUNT_PUBLIC_KEY}
+            IDENTITY_SIGNING_KEY=${IDENTITY_SIGNING_KEY}
+            GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+            GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+            GOOGLE_REDIRECT_URI=https://${DEPLOY_DOMAIN}/auth/callback
+            APPLE_CLIENT_ID=${APPLE_CLIENT_ID}
+            APPLE_TEAM_ID=${APPLE_TEAM_ID}
+            APPLE_KEY_ID=${APPLE_KEY_ID}
+            APPLE_PRIVATE_KEY_FILE=/app/apple_private_key.pem
+            APPLE_REDIRECT_URI=https://${DEPLOY_DOMAIN}/auth/apple/callback
+            RESEND_API_KEY=${RESEND_API_KEY}
+            NATS_PUBLIC_URL=tls://${DEPLOY_DOMAIN}:4222
+            RESEND_FROM=Handrive <noreply@handrive.ai>
+            DEMO_EMAIL=${DEMO_EMAIL}
+            DEMO_OTP=${DEMO_OTP}
+            EOF
+
+            # Ensure external Docker network exists (needed for cross-compose communication)
+            docker network create caddy_net 2>/dev/null || true
+
+            # Build server container
+            echo "Building server container..."
+            docker compose -f docker-compose.prod.yml build server
+
+            # Ensure infrastructure services are running (caddy, nats, cert-exporter)
+            # This is idempotent - won't restart if already running
+            echo "Ensuring infrastructure services are running..."
+            docker compose -f docker-compose.prod.yml up -d caddy
+
+            # Wait for Caddy to be ready and get certificates
+            echo "Waiting for Caddy and TLS certificates..."
+            CADDY_READY=false
+            for i in {1..60}; do
+              # Check if Caddy is running
+              if ! docker compose -f docker-compose.prod.yml ps caddy | grep -q "Up"; then
+                echo "  $i/60: Caddy not running yet..."
+                sleep 5
+                continue
+              fi
+
+              # Check for TLS certificates
+              if docker compose -f docker-compose.prod.yml exec -T caddy test -f /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DEPLOY_DOMAIN}/${DEPLOY_DOMAIN}.crt 2>/dev/null; then
+                echo "✓ Caddy ready with TLS certificates!"
+                CADDY_READY=true
+                break
+              fi
+
+              echo "  $i/60: Waiting for TLS certificates... ($((i*5))s)"
+              sleep 5
+            done
+
+            if [ "$CADDY_READY" = "false" ]; then
+              echo "⚠ Caddy may not have TLS certificates yet, checking logs..."
+              docker compose -f docker-compose.prod.yml logs --tail=30 caddy
+            fi
+
+            # Start infrastructure services (cert-exporter, nats) if not running
+            echo "Starting infrastructure services..."
+            docker compose -f docker-compose.prod.yml up -d cert-exporter nats
+
+            # Rolling restart: rebuild and restart only the server container
+            # Other services stay up, minimizing downtime
+            echo "Deploying server with rolling restart..."
+            if ! docker compose -f docker-compose.prod.yml up -d --build --force-recreate --no-deps server 2>&1; then
+              echo "⚠ Server deploy failed, checking logs..."
+              echo "=== Server logs ==="
+              docker compose -f docker-compose.prod.yml logs --tail=50 server || true
+              echo "=== Container status ==="
+              docker ps -a
+              # Continue anyway to try the health check loop
+            fi
+
+            # Wait for all services to be healthy
+            echo "Waiting for all services to be healthy..."
+            for i in {1..24}; do
+              HEALTHY_COUNT=$(docker compose -f docker-compose.prod.yml ps | grep -c "(healthy)" || echo "0")
+              RUNNING_COUNT=$(docker compose -f docker-compose.prod.yml ps | grep -c "Up" || echo "0")
+              echo "  $i/24: $HEALTHY_COUNT healthy, $RUNNING_COUNT running..."
+
+              if [ "$HEALTHY_COUNT" -ge 4 ]; then
+                echo "✓ All 4 services healthy!"
+                break
+              fi
+              sleep 5
+            done
+
+            docker compose -f docker-compose.prod.yml ps
+
+            # Health check via Caddy (server port is not exposed to host)
+            if docker compose -f docker-compose.prod.yml exec -T server curl -sf http://localhost:3001/api/health > /dev/null; then
+              echo "✓ Deployment successful!"
+              echo "API: https://${DEPLOY_DOMAIN}"
+              echo "NATS: tls://${DEPLOY_DOMAIN}:4222"
+            else
+              echo "✗ Health check failed"
+              echo ""
+              echo "=== Caddy logs ==="
+              docker compose -f docker-compose.prod.yml logs --tail=50 caddy
+              echo ""
+              echo "=== NATS logs ==="
+              docker compose -f docker-compose.prod.yml logs --tail=30 nats
+              echo ""
+              echo "=== Server logs ==="
+              docker compose -f docker-compose.prod.yml logs --tail=50 server
+              echo ""
+              echo "=== Container status ==="
+              docker ps -a
+              exit 1
+            fi
+
+      # ========== Setup Monitoring ==========
+      - name: Enable DigitalOcean Monitoring
+        run: |
+          # Get droplet ID
+          DROPLET_ID=$(doctl compute droplet list --format ID,Name --no-header | grep "${{ env.DROPLET_NAME }}" | awk '{print $1}')
+
+          if [ -n "$DROPLET_ID" ]; then
+            echo "Enabling monitoring for droplet $DROPLET_ID..."
+
+            # Enable monitoring agent (idempotent)
+            doctl compute droplet-action enable-monitoring $DROPLET_ID --wait || true
+
+            echo "✓ Monitoring enabled"
+          fi
+
+      - name: Setup Alert Policies
+        run: |
+          # Get droplet ID
+          DROPLET_ID=$(doctl compute droplet list --format ID,Name --no-header | grep "${{ env.DROPLET_NAME }}" | awk '{print $1}')
+
+          if [ -z "$DROPLET_ID" ]; then
+            echo "Droplet not found, skipping alerts"
+            exit 0
+          fi
+
+          # Check if alerts already exist
+          EXISTING_ALERTS=$(doctl monitoring alert list --format Name --no-header 2>/dev/null || echo "")
+
+          # CPU Alert - High CPU usage
+          if ! echo "$EXISTING_ALERTS" | grep -q "handrive-cpu-alert"; then
+            echo "Creating CPU alert..."
+            doctl monitoring alert create \
+              --type "v1/insights/droplet/cpu" \
+              --compare "GreaterThan" \
+              --value 80 \
+              --window "5m" \
+              --entities "$DROPLET_ID" \
+              --emails "han@handrive.ai" \
+              --description "CPU usage above 80% for 5 minutes" \
+              handrive-cpu-alert || true
+          fi
+
+          # Memory Alert - High memory usage
+          if ! echo "$EXISTING_ALERTS" | grep -q "handrive-memory-alert"; then
+            echo "Creating memory alert..."
+            doctl monitoring alert create \
+              --type "v1/insights/droplet/memory_utilization_percent" \
+              --compare "GreaterThan" \
+              --value 85 \
+              --window "5m" \
+              --entities "$DROPLET_ID" \
+              --emails "han@handrive.ai" \
+              --description "Memory usage above 85% for 5 minutes" \
+              handrive-memory-alert || true
+          fi
+
+          # Disk Alert - High disk usage
+          if ! echo "$EXISTING_ALERTS" | grep -q "handrive-disk-alert"; then
+            echo "Creating disk alert..."
+            doctl monitoring alert create \
+              --type "v1/insights/droplet/disk_utilization_percent" \
+              --compare "GreaterThan" \
+              --value 85 \
+              --window "5m" \
+              --entities "$DROPLET_ID" \
+              --emails "han@handrive.ai" \
+              --description "Disk usage above 85% for 5 minutes" \
+              handrive-disk-alert || true
+          fi
+
+          # Network Inbound Alert - High bandwidth (potential attack or spike)
+          if ! echo "$EXISTING_ALERTS" | grep -q "handrive-network-in-alert"; then
+            echo "Creating network inbound alert..."
+            doctl monitoring alert create \
+              --type "v1/insights/droplet/public_inbound_bandwidth" \
+              --compare "GreaterThan" \
+              --value 100000000 \
+              --window "5m" \
+              --entities "$DROPLET_ID" \
+              --emails "han@handrive.ai" \
+              --description "Inbound bandwidth above 100 Mbps for 5 minutes" \
+              handrive-network-in-alert || true
+          fi
+
+          # Network Outbound Alert - High bandwidth
+          if ! echo "$EXISTING_ALERTS" | grep -q "handrive-network-out-alert"; then
+            echo "Creating network outbound alert..."
+            doctl monitoring alert create \
+              --type "v1/insights/droplet/public_outbound_bandwidth" \
+              --compare "GreaterThan" \
+              --value 100000000 \
+              --window "5m" \
+              --entities "$DROPLET_ID" \
+              --emails "han@handrive.ai" \
+              --description "Outbound bandwidth above 100 Mbps for 5 minutes" \
+              handrive-network-out-alert || true
+          fi
+
+          echo "✓ Alert policies configured"
+          doctl monitoring alert list --format Name,Type,Enabled
+
+      - name: Setup Uptime Check
+        run: |
+          # Check if uptime check already exists using JSON output
+          EXISTING_CHECK=$(doctl monitoring uptime check list -o json 2>/dev/null | grep -o '"name":"handrive-health"' || echo "")
+
+          if [ -z "$EXISTING_CHECK" ]; then
+            echo "Creating uptime check for health endpoint..."
+            # Name is positional argument, not a flag
+            doctl monitoring uptime create handrive-health \
+              --type "https" \
+              --target "https://${{ env.DOMAIN }}/api/health" \
+              --regions "us_east,us_west,eu_west" || true
+
+            # Get the check ID and create an alert for it
+            CHECK_ID=$(doctl monitoring uptime check list -o json 2>/dev/null | grep -B5 '"name":"handrive-health"' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+            if [ -n "$CHECK_ID" ]; then
+              echo "Creating uptime alert for check $CHECK_ID..."
+              doctl monitoring uptime alert create $CHECK_ID \
+                --name "handrive-health-down" \
+                --type "down" \
+                --emails "han@handrive.ai" \
+                --period "2m" \
+                --comparison "greater_than" \
+                --threshold 1 || true
+            fi
+          else
+            echo "Uptime check already exists"
+          fi
+
+          echo "✓ Uptime check configured"
+          doctl monitoring uptime check list -o json | head -50 || true
+
+      # ========== Update DNS (optional) ==========
+      - name: Update DNS record
+        if: steps.droplet.outputs.is_new == 'true'
+        run: |
+          echo "=========================================="
+          echo "ACTION REQUIRED: Update DNS"
+          echo "=========================================="
+          echo "Add an A record for your domain:"
+          echo ""
+          echo "  Type: A"
+          echo "  Name: api"
+          echo "  Value: ${{ steps.droplet.outputs.ip }}"
+          echo ""
+          echo "=========================================="

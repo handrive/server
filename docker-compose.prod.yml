@@ -1,0 +1,216 @@
+# =============================================================================
+# Production Docker Compose for DigitalOcean Droplet
+# =============================================================================
+#
+# Architecture:
+#   Internet → Caddy (:443 HTTPS) → Server (:3001)
+#   Internet → NATS (:4222 TLS) ← shared certs from Caddy
+#   Server  → NATS (internal, via domain alias)
+#
+# Components:
+#   - Caddy: Reverse proxy + auto Let's Encrypt TLS certificates
+#   - cert-exporter: Copies Caddy certs to shared volumes for NATS TLS
+#   - NATS: Message broker for P2P sync (native TLS)
+#   - Server: Rust/Axum API backend
+#
+# Requirements:
+#   - DigitalOcean Droplet: 2GB RAM recommended ($12/mo)
+#   - DigitalOcean Managed PostgreSQL ($15/mo)
+#   - Domain with DNS A record pointing to Droplet IP
+#
+# Required Environment Variables:
+#   - DOMAIN: Production domain (e.g., api.handrive.ai)
+#   - DATABASE_URL: PostgreSQL connection string
+#   - JWT_SECRET: Min 32 characters for signing tokens
+#   - NATS_ACCOUNT_SIGNING_KEY: NATS account seed (starts with SA)
+#   - NATS_ACCOUNT_PUBLIC_KEY: NATS account public key (starts with A)
+#   - IDENTITY_SIGNING_KEY: Ed25519 key for NATS message signing
+#   - GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET: For Google OAuth
+#   - RESEND_API_KEY: For email OTP (get from resend.com)
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Caddy - Reverse proxy + automatic TLS certificates
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - DOMAIN=${DOMAIN}
+    networks:
+      - default
+      - caddy_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Certificate exporter - Copies Caddy certs for NATS TLS
+  # ---------------------------------------------------------------------------
+  cert-exporter:
+    image: alpine:3.19
+    volumes:
+      - caddy_data:/caddy_data:ro
+      - certs_prod:/certs
+    environment:
+      - DOMAIN=${DOMAIN}
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache inotify-tools
+
+        export_certs() {
+          CERT_DIR="/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$${DOMAIN}"
+          if [ -f "$${CERT_DIR}/$${DOMAIN}.crt" ]; then
+            cp "$${CERT_DIR}/$${DOMAIN}.crt" /certs/server.crt
+            cp "$${CERT_DIR}/$${DOMAIN}.key" /certs/server.key
+            chmod 644 /certs/server.crt
+            chmod 600 /certs/server.key
+            echo "$$(date): Certificates exported for $${DOMAIN}"
+          fi
+        }
+
+        # Wait for certificates
+        echo "Waiting for certificates..."
+        while [ ! -f "/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$${DOMAIN}/$${DOMAIN}.crt" ]; do
+          sleep 5
+        done
+        export_certs
+
+        # Watch for cert renewals
+        while true; do
+          inotifywait -q -e modify -e create -r /caddy_data/caddy/certificates/ 2>/dev/null || sleep 3600
+          export_certs
+        done
+    depends_on:
+      caddy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/certs/server.crt"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # NATS - Message broker (TLS)
+  # ---------------------------------------------------------------------------
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - "-c"
+      - "/etc/nats/nats.conf"
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - certs_prod:/certs:ro
+    ports:
+      - "4222:4222"              # TLS client connections
+      - "127.0.0.1:8222:8222"    # HTTP monitoring (localhost only)
+    networks:
+      default:
+        aliases:
+          - ${DOMAIN}            # Allows server to connect via domain name
+    depends_on:
+      cert-exporter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /certs/server.crt"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Server - Rust/Axum API backend
+  # ---------------------------------------------------------------------------
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Database
+      DATABASE_URL: ${DATABASE_URL}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      # JWT
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ACCESS_TTL_SECS: ${JWT_ACCESS_TTL_SECS:-900}
+      JWT_REFRESH_TTL_SECS: ${JWT_REFRESH_TTL_SECS:-604800}
+      # Server
+      HOST: "0.0.0.0"
+      PORT: "3001"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_DIR: /var/log/handrive
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://${DOMAIN}}
+      # NATS (TLS via domain - cert matches)
+      NATS_URL: tls://${DOMAIN}:4222
+      NATS_PUBLIC_URL: ${NATS_PUBLIC_URL:-tls://${DOMAIN}:4222}
+      NATS_ACCOUNT_SIGNING_KEY: ${NATS_ACCOUNT_SIGNING_KEY}
+      NATS_ACCOUNT_PUBLIC_KEY: ${NATS_ACCOUNT_PUBLIC_KEY}
+      # Identity credentials (NATS message signing)
+      IDENTITY_SIGNING_KEY: ${IDENTITY_SIGNING_KEY:-}
+      # Google OAuth
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-https://${DOMAIN}/api/auth/google/callback}
+      # Apple Sign In OAuth (optional - for iOS App Store)
+      APPLE_CLIENT_ID: ${APPLE_CLIENT_ID:-}
+      APPLE_TEAM_ID: ${APPLE_TEAM_ID:-}
+      APPLE_KEY_ID: ${APPLE_KEY_ID:-}
+      APPLE_PRIVATE_KEY_FILE: ${APPLE_PRIVATE_KEY_FILE:-}
+      APPLE_REDIRECT_URI: ${APPLE_REDIRECT_URI:-https://${DOMAIN}/auth/apple/callback}
+      # Resend (email API)
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      RESEND_FROM: ${RESEND_FROM:-Handrive <noreply@handrive.ai>}
+      # Demo account for App Store review (optional)
+      DEMO_EMAIL: ${DEMO_EMAIL:-}
+      DEMO_OTP: ${DEMO_OTP:-}
+    volumes:
+      # Apple Sign In private key (optional - only if file exists)
+      - ./apple_private_key.pem:/app/apple_private_key.pem:ro
+    networks:
+      - default
+      - caddy_net
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  caddy_data:
+  caddy_config:
+  certs_prod:
+
+networks:
+  caddy_net:
+    external: true
